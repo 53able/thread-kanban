@@ -20,8 +20,8 @@ describe('package.json', () => {
     type: string;
   };
 
-  it('typecheck (tsc --noEmit) と test (vitest run) スクリプトがあり、依存に @modelcontextprotocol/server ^2.4.0 がある', () => {
-    expect(pkg.scripts.typecheck).toBe('tsc --noEmit');
+  it('typecheck（ルートと ui/ の tsc --noEmit）と test (vitest run) スクリプトがあり、依存に @modelcontextprotocol/server ^2.4.0 がある', () => {
+    expect(pkg.scripts.typecheck).toBe('tsc --noEmit && tsc -p ui/tsconfig.json --noEmit');
     expect(pkg.scripts.test).toBe('vitest run');
     expect(pkg.dependencies['@modelcontextprotocol/server']).toBe('^2.4.0');
     expect(pkg.dependencies['@modelcontextprotocol/sdk']).toBeUndefined();
@@ -90,7 +90,7 @@ describe('テストの衛生', () => {
   it('skip / only / todo / TODO を含むテストがない', () => {
     const banned = [/\b(?:it|test|describe)\.(?:skip|only|todo)\b/, /\bx(?:it|describe)\(/, /\bTODO\b/, /\bFIXME\b/];
     const offenders: string[] = [];
-    for (const file of filesUnder(join(ROOT, 'tests')).concat(filesUnder(join(ROOT, 'src')))) {
+    for (const file of [...filesUnder(join(ROOT, 'tests')), ...filesUnder(join(ROOT, 'src')), ...filesUnder(join(ROOT, 'ui'))]) {
       if (file === import.meta.filename) continue;
       const src = readFileSync(file, 'utf8');
       for (const re of banned) if (re.test(src)) offenders.push(`${relative(ROOT, file)}: ${re}`);
