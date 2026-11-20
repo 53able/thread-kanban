@@ -1,8 +1,11 @@
 // 開いているボードごとの接続と配信。SSE のクライアントが何人いても Reader とポーリングは 1 本。
 import type { ServerResponse } from 'node:http';
-import type { Clock } from '../domain/types.js';
+import { blockCard, unblockCard, type BlockArgs, type UnblockArgs } from '../app/block.js';
+import { moveCard, type MoveInput } from '../app/move.js';
+import { fail, ok, type Clock, type Result } from '../domain/types.js';
 import { KanbanReader, KanbanStore } from '../store/sqlite.js';
 import { boardLabel, dbFileExists } from './discovery.js';
+import { threadIdFromPath } from './schemas.js';
 import type { BoardResponse, BoardSummary } from './types.js';
 import { boardResponse, cardsById, toUiEvent, type Snapshot } from './views.js';
 
@@ -49,7 +52,7 @@ function isSqliteError(e: unknown): boolean {
  * columns.entry_criteria）を JSON.parse できない SyntaxError（データの破損）。
  * それ以外（TypeError など）はプログラムの誤りなので、ここに含めず 500 INTERNAL にする。
  */
-export function isBoardDataError(e: unknown): boolean {
+function isBoardDataError(e: unknown): boolean {
   return isSqliteError(e) || e instanceof SyntaxError;
 }
 
@@ -98,7 +101,7 @@ export class BoardSession {
    * Reader（DB ファイルがまだなければ null）。開いたときの data_version を覚えておく。
    * ファイルがあるのに開けなければ BoardUnavailableError（次の呼び出しで開き直す）。
    */
-  getReader(): KanbanReader | null {
+  private getReader(): KanbanReader | null {
     if (this.closed) return null;
     if (this.reader !== null) return this.reader;
     if (!dbFileExists(this.entry.dbPath)) return null;
@@ -137,7 +140,7 @@ export class BoardSession {
   }
 
   /** 書き込み用の接続。最初の POST で、DB にある boardId と渡された clock で開く。開けなければ BoardUnavailableError。 */
-  getStore(): KanbanStore {
+  private getStore(): KanbanStore {
     if (this.store === null) {
       this.store = this.guard('Store を開けません', () =>
         KanbanStore.open({
@@ -151,6 +154,10 @@ export class BoardSession {
     return this.store;
   }
 
+  private readBatch(reader: KanbanReader, cursor?: number): ReturnType<KanbanReader['readSince']> {
+    return reader.readSince(cursor ?? Number.MAX_SAFE_INTEGER, cursor === undefined ? 0 : this.options.maxEvents);
+  }
+
   /**
    * snapshot と最大のイベント id を同じ読み取りトランザクションで取る。
    * snapshot が null になるのは DB ファイルがない・ボードの行がないときだけ。開けない・読めないときは
@@ -159,7 +166,7 @@ export class BoardSession {
   readSnapshot(): { snapshot: Snapshot; lastEventId: number } {
     const reader = this.getReader();
     if (reader === null) return { snapshot: null, lastEventId: 0 };
-    const batch = this.guard('ボードを読めません', () => reader.readSince(Number.MAX_SAFE_INTEGER, 0));
+    const batch = this.guard('ボードを読めません', () => this.readBatch(reader));
     return { snapshot: batch.snapshot, lastEventId: batch.maxEventId };
   }
 
@@ -171,7 +178,7 @@ export class BoardSession {
   }
 
   /** 書き込みの直後の最大のイベント id（UI がどの snapshot まで古いかを判定する）。読めなければ undefined。 */
-  lastEventIdAfterWrite(): number | undefined {
+  private lastEventIdAfterWrite(): number | undefined {
     try {
       return this.getReader()?.maxEventId();
     } catch {
@@ -206,9 +213,40 @@ export class BoardSession {
     return this.clients.size;
   }
 
-  /** 書き込みの後にポーリングの 1 回分をすぐに実行する（配信の経路は 1 本だけ）。 */
-  pollNow(): void {
-    this.poll();
+  move(threadId: string, input: MoveInput) {
+    return this.writeCard(threadId, (args) => moveCard({ ...args, input }));
+  }
+
+  block(threadId: string, input: BlockArgs['input']) {
+    return this.writeCard(threadId, (args) => blockCard({ ...args, input }));
+  }
+
+  unblock(threadId: string, input: UnblockArgs['input']) {
+    return this.writeCard(threadId, (args) => unblockCard({ ...args, input }));
+  }
+
+  /** Web の書き込みに共通する事前確認と、成功後の配信・イベント位置の取得。 */
+  private writeCard<T extends object>(
+    rawThreadId: string,
+    action: (args: { store: KanbanStore; threadId: string; t3Available: false; actor: 'ui' }) => Result<T>,
+  ): Result<T & { lastEventId: number | undefined }> {
+    const id = threadIdFromPath(rawThreadId);
+    if (!id.ok) return id;
+    if (this.readSnapshot().snapshot === null) {
+      return fail('CARD_NOT_FOUND', `threadId ${id.value} のカードはありません。先に kanban_card_add で登録してください`, {
+        threadId: id.value,
+      });
+    }
+    try {
+      const result = action({ store: this.getStore(), threadId: id.value, t3Available: false, actor: 'ui' });
+      if (!result.ok) return result;
+      this.poll();
+      return ok({ ...result.value, lastEventId: this.lastEventIdAfterWrite() });
+    } catch (e) {
+      if (isBusyError(e) || !isBoardDataError(e)) throw e;
+      this.options.log(`書き込めません（${this.entry.dbPath}）: ${(e as Error).message}`);
+      throw new BoardUnavailableError((e as Error).message);
+    }
   }
 
   private startLoops(): void {
@@ -298,25 +336,20 @@ export class BoardSession {
     let maxEventId = 0;
     if (reader !== null) {
       try {
-        const batch = withEvents
-          ? reader.readSince(Math.min(...targets.map((t) => t.cursor)), this.options.maxEvents)
-          : reader.readSince(Number.MAX_SAFE_INTEGER, 0);
+        const batch = this.guard('ボードを読めません', () => {
+          const batch = this.readBatch(reader, withEvents ? Math.min(...targets.map((t) => t.cursor)) : undefined);
+          if (batch.snapshot !== null) this.entry.label = boardLabel(reader.basePath(), this.entry.boardId);
+          return batch;
+        });
         ({ snapshot, events, truncated, maxEventId } = batch);
-        // 表示名は base_path から毎回組み直す（ボードの行がまだなければ一覧のときの表示名のまま）
-        if (snapshot !== null) this.entry.label = boardLabel(reader.basePath(), this.entry.boardId);
       } catch (e) {
         if (isBusyError(e)) {
           this.logError(`ボードを読めません（${this.entry.dbPath}）: ${(e as Error).message}`);
           this.lastVersion = null;
           return false;
         }
-        if (isBoardDataError(e)) {
-          // 壊れたファイル・壊れた行など。Reader を閉じて次は開き直す（ファイルが置き換えられた場合など）
-          this.logError(`ボードを読めません（${this.entry.dbPath}）: ${(e as Error).message}`);
-          this.dropReader();
-        } else {
-          // プログラムの誤り。ポーリングのタイマーから呼ばれるので投げ直さず、スタックをログに出して接続を閉じる
-          // （再接続の stream の事前の読み取りで同じ例外が 500 INTERNAL になる）
+        if (!(e instanceof BoardUnavailableError)) {
+          // タイマーからの呼び出しなので、内部エラーもログに記録して接続を閉じる。
           this.logError(`内部エラー: ${(e as Error).stack ?? String(e)}`);
         }
         this.closeClients(targets);

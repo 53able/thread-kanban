@@ -6,13 +6,13 @@ import type { AddressInfo } from 'node:net';
 import { dirname, extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type * as z from 'zod/v4';
-import { blockCard, toBlockResponse, toUnblockResponse, unblockCard } from '../app/block.js';
-import { moveCard, toMoveResponse } from '../app/move.js';
-import { systemClock, type Clock, type ErrorCode, type KanbanError, type Result } from '../domain/types.js';
+import { toBlockResponse, toUnblockResponse } from '../app/block.js';
+import { toMoveResponse } from '../app/move.js';
+import { systemClock, type Clock, type ErrorCode, type KanbanError } from '../domain/types.js';
 import { discoverBoards, kanbanDir, normalizeDbPath, type DefaultBoard } from './discovery.js';
 import { loadRegisteredDbs, saveRegisteredDbs } from './files.js';
 import { blockBodySchema, loginCodeBodySchema, moveBodySchema, registerDbBodySchema, threadIdFromPath, unblockBodySchema } from './schemas.js';
-import { BoardSession, BoardUnavailableError, isBoardDataError, isBusyError } from './session.js';
+import { BoardSession, BoardUnavailableError, isBusyError } from './session.js';
 import type { BoardKey, BoardSummary, UiOnlyErrorCode } from './types.js';
 import { boardResponse, cardsById, moveOptions, toUiEvent } from './views.js';
 
@@ -353,37 +353,6 @@ export async function createUiServer(options: UiServerOptions): Promise<UiServer
     return { threadId: id.value, card, snapshot, lastEventId } as const;
   };
 
-  /**
-   * 書き込み。DB にボードがなければ Store を開かない（ボードの行を作らない）。
-   * SQLITE_BUSY は 503 BUSY、それ以外の DB の失敗（読み取り専用・壊れたファイルなど）は 503 BOARD_UNAVAILABLE。
-   */
-  const write = <T>(session: BoardSession, rawThreadId: string, fn: (threadId: string) => Result<T>): Result<T> => {
-    const id = threadIdFromPath(rawThreadId);
-    if (!id.ok) return id;
-    if (session.readSnapshot().snapshot === null) {
-      return {
-        ok: false,
-        error: {
-          code: 'CARD_NOT_FOUND',
-          message: `threadId ${id.value} のカードはありません。先に kanban_card_add で登録してください`,
-          details: { threadId: id.value },
-        },
-      };
-    }
-    try {
-      const result = fn(id.value);
-      if (result.ok) session.pollNow();
-      return result;
-    } catch (e) {
-      if (isBusyError(e)) throw new HttpError(503, 'BUSY', 'DB がロックされています。少し待ってから再試行してください');
-      if (isBoardDataError(e)) {
-        log(`書き込めません（${session.entry.dbPath}）: ${(e as Error).message}`);
-        throw new BoardUnavailableError((e as Error).message);
-      }
-      throw e;
-    }
-  };
-
   const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL, segments: string[]): Promise<void> => {
     const method = req.method ?? 'GET';
     // segments[0] === 'api'
@@ -477,29 +446,23 @@ export async function createUiServer(options: UiServerOptions): Promise<UiServer
         if (input.to === 'discarded') {
           throw new HttpError(400, 'UI_DISCARD_NOT_ALLOWED', 'UI からは discarded へ移動できません。エージェントか MCP を経由してください');
         }
-        const result = write(session, rawThreadId, (threadId) =>
-          moveCard({ store: session.getStore(), threadId, input, t3Available: false, actor: 'ui' }),
-        );
+        const result = session.move(rawThreadId, input);
         if (!result.ok) return sendFailure(res, result.error);
-        sendJson(res, 200, { ok: true, ...toMoveResponse(result.value), notes: result.value.notes, lastEventId: session.lastEventIdAfterWrite() });
+        sendJson(res, 200, { ok: true, ...toMoveResponse(result.value), notes: result.value.notes, lastEventId: result.value.lastEventId });
         return;
       }
       if (method === 'POST' && action === 'block') {
         const input = await parseBody(req, blockBodySchema);
-        const result = write(session, rawThreadId, (threadId) =>
-          blockCard({ store: session.getStore(), threadId, input, t3Available: false, actor: 'ui' }),
-        );
+        const result = session.block(rawThreadId, input);
         if (!result.ok) return sendFailure(res, result.error);
-        sendJson(res, 200, { ok: true, ...toBlockResponse(result.value), lastEventId: session.lastEventIdAfterWrite() });
+        sendJson(res, 200, { ok: true, ...toBlockResponse(result.value), lastEventId: result.value.lastEventId });
         return;
       }
       if (method === 'POST' && action === 'unblock') {
         const input = await parseBody(req, unblockBodySchema);
-        const result = write(session, rawThreadId, (threadId) =>
-          unblockCard({ store: session.getStore(), threadId, input, t3Available: false, actor: 'ui' }),
-        );
+        const result = session.unblock(rawThreadId, input);
         if (!result.ok) return sendFailure(res, result.error);
-        sendJson(res, 200, { ok: true, ...toUnblockResponse(result.value), lastEventId: session.lastEventIdAfterWrite() });
+        sendJson(res, 200, { ok: true, ...toUnblockResponse(result.value), lastEventId: result.value.lastEventId });
         return;
       }
     }
