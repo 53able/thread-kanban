@@ -1,18 +1,17 @@
-// 画面全体の状態と操作。状態遷移の判定は ui/state.ts の純粋な関数に任せ、ここでは配線だけを行う。
+// 画面の操作・選択・フォーカスと、ボードのセッションをつなぐ。
 
 import type { JSX, TargetedFocusEvent, TargetedKeyboardEvent, TargetedPointerEvent } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import * as api from '../api.js';
-import type { ApiFailure, BoardCardView, BoardKey, BoardResponse, BoardSummary, Column, MoveOption, UiEvent } from '../api-types.js';
+import type { ApiFailure, BoardCardView, BoardResponse, Column, MoveOption, UiEvent } from '../api-types.js';
 import * as platform from '../platform.js';
-import { openStream, type StreamHandle } from '../sse.js';
+import { useBoardSession, type BoardAction } from '../board-session.js';
+import { useRefState } from '../use-ref-state.js';
 import {
   OWN_ACTION_TTL_MS,
   applyOptimisticMove,
   buildMoveBody,
-  classifyDisconnect,
   columnVerdicts,
-  decideDisconnect,
   dismissToast,
   displayColumns,
   emptyToasts,
@@ -20,18 +19,13 @@ import {
   eventsToToasts,
   findCard,
   grabbedCardNotice,
-  ingestSnapshot,
   moveSteps,
   nextFocus,
-  offerSnapshot,
-  pendingAfterMove,
   pruneOwnActions,
   pushToasts,
   releaseHeldToasts,
-  releaseSnapshot,
   resolveSelection,
   settleToast,
-  type Banner,
   type OwnAction,
   type ToastInput,
   type ToastState,
@@ -48,22 +42,6 @@ const AUTOSCROLL_EDGE_PX = 40;
 const AUTOSCROLL_SPEED_PX = 8;
 const NARROW_QUERY = '(max-width: 479.98px)';
 
-export function parseHashKey(hash: string): BoardKey | null {
-  const value = new URLSearchParams(hash.replace(/^#/, '')).get('board');
-  return value === null || value === '' ? null : value;
-}
-
-/** useState と同じ値を ref にも持つ（SSE などの非同期のコールバックから最新の値を読むため）。 */
-function useRefState<T>(initial: T): [T, (value: T) => void, { current: T }] {
-  const [value, setValue] = useState<T>(initial);
-  const ref = useRef<T>(initial);
-  const set = (next: T): void => {
-    ref.current = next;
-    setValue(next);
-  };
-  return [value, set, ref];
-}
-
 function cardOf(resp: BoardResponse | null, threadId: string): BoardCardView | null {
   return resp?.board?.columns.flatMap((c) => c.cards).find((c) => c.threadId === threadId) ?? null;
 }
@@ -73,10 +51,6 @@ function failureText(r: ApiFailure): string {
 }
 
 export function App(): JSX.Element {
-  const [boards, setBoards] = useState<BoardSummary[]>([]);
-  const [key, setKey, keyRef] = useRefState<BoardKey | null>(null);
-  const [loaded, setLoaded] = useState(false);
-  const [resp, setResp, respRef] = useRefState<BoardResponse | null>(null);
   const [selected, setSelected, selectedRef] = useRefState<string | null>(null);
   const [focusColumn, setFocusColumn] = useState<Column | null>(null);
   const [grab, setGrab, grabRef] = useRefState<GrabState | null>(null);
@@ -88,27 +62,16 @@ export function App(): JSX.Element {
   const [drawerOptions, setDrawerOptions] = useState<MoveOption[] | null>(null);
   const [drawerPending, setDrawerPending] = useState(false);
   const [toasts, setToasts] = useState<ToastState>(emptyToasts);
-  const [banner, setBanner] = useState<Banner>(null);
   const [highlighted, setHighlighted] = useState<ReadonlySet<number>>(new Set());
   const [narrow, setNarrow] = useState(false);
   const [activeColumn, setActiveColumn] = useState<Column | null>(null);
-  const [reloadToken, setReloadToken] = useState(0);
-
-  const pendingRef = useRef<BoardResponse | null>(null);
   const rollbackRef = useRef<BoardResponse | null>(null);
-  // 移動を始めたボード。送信はこのボードへ行い、応答の時点で別のボードを表示していれば結果を反映しない
-  const moveKeyRef = useRef<BoardKey | null>(null);
-  // ボードの世代。ボードを切り替えるたびに進め、非同期の応答は送信したときの世代と一致するときだけ反映する
-  // （A → B → A と戻ったときに、最初の A の応答を反映しない）
-  const genRef = useRef(0);
+  const moveActionRef = useRef<BoardAction | null>(null);
   const ownRef = useRef<OwnAction[]>([]);
   const interactionRef = useRef<string | null>(null);
-  const streamRef = useRef<StreamHandle | null>(null);
-  const commitWaiters = useRef<(() => void)[]>([]);
   const boardRef = useRef<HTMLDivElement>(null);
   const forceFocusRef = useRef(false);
   const seqRef = useRef(0);
-  const shownKeyRef = useRef<BoardKey | null>(null);
   // ポインターでのドラッグを落とした直後の click（カードの onClick へ伝わる）を無視する
   const justDraggedRef = useRef(false);
   const highlightTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -126,14 +89,8 @@ export function App(): JSX.Element {
 
   const toast = (inputs: ToastInput[]): void => setToasts((s) => pushToasts(s, inputs, isModal()));
 
-  /**
-   * 操作の送信先。表示中の resp のキーで、選んでいるボード（key）と一致するときだけ返す。
-   * 切り替えの途中（新しいボードをまだ取得していない）は null で、操作しない。
-   */
-  const actionKey = (): BoardKey | null => {
-    const current = respRef.current;
-    return current !== null && current.key === keyRef.current ? current.key : null;
-  };
+  const { boards, key, loaded, resp, banner, selectBoard, retry, beginAction, current, setResp, reconcileMove } =
+    useBoardSession({ busy, isBusy, onBoardChange, onEvents, onTruncated, onRelease, onApply });
 
   const markOwnAction = (threadId: string): OwnAction => {
     const record: OwnAction = { threadId, expiresAt: Date.now() + OWN_ACTION_TTL_MS };
@@ -147,9 +104,7 @@ export function App(): JSX.Element {
 
   // ------------------------------------------------------------ snapshot と events
 
-  const applySnapshot = (next: BoardResponse, animate: boolean): void => {
-    const prev = respRef.current;
-    const ing = ingestSnapshot(prev, next);
+  function onApply(prev: BoardResponse | null, next: BoardResponse, changed: readonly number[]): void {
     const sel = selectedRef.current;
     if (sel !== null && next.board !== null) {
       const target = resolveSelection(prev?.board ?? null, next.board, sel);
@@ -161,179 +116,74 @@ export function App(): JSX.Element {
         setFocusColumn(target.column);
       }
     }
-    if (ing.changed.length > 0) {
-      setHighlighted(new Set(ing.changed));
+    if (changed.length > 0) {
+      setHighlighted(new Set(changed));
       clearTimeout(highlightTimer.current);
       highlightTimer.current = setTimeout(() => setHighlighted(new Set()), HIGHLIGHT_MS);
     }
-    if (animate && ing.columnMoved) {
-      // 次の snapshot が prev として読めるように ref はすぐに更新する。update は非同期に走るので、
-      // その時点で ref が別のもの（後から届いた snapshot など）に変わっていれば何もしない
-      respRef.current = next;
-      platform.startViewTransition(
-        () =>
-          new Promise<void>((resolve) => {
-            if (respRef.current !== next) {
-              resolve();
-              return;
-            }
-            commitWaiters.current.push(resolve);
-            setResp(next);
-          }),
-      );
-    } else {
-      setResp(next);
-    }
-  };
+  }
 
-  const onSnapshot = (next: BoardResponse): void => {
-    const gate = offerSnapshot(next, isBusy());
-    pendingRef.current = gate.pending;
-    if (next.truncated === true) {
-      // イベントを送らない配信なので、件数の分からない 1 件のトーストにして、開いている履歴を読み直す
-      toast([{ text: '多数の更新がありました', persistent: false }]);
-      const open = drawerRef.current;
-      if (open !== null) void loadDrawerEvents(open);
-    }
-    if (gate.apply !== null) applySnapshot(gate.apply, true);
-  };
+  function onTruncated(): void {
+    // イベントを送らない配信なので、件数の分からない 1 件のトーストにして、開いている履歴を読み直す
+    toast([{ text: '多数の更新がありました', persistent: false }]);
+    const open = drawerRef.current;
+    if (open !== null) void loadDrawerEvents(open);
+  }
 
   const loadDrawerEvents = async (threadId: string): Promise<void> => {
-    const k = actionKey();
-    if (k === null) return;
-    const gen = genRef.current;
-    const r = await api.getCardEvents(k, threadId);
-    if (genRef.current === gen && drawerRef.current === threadId) setDrawerEvents(r.ok ? r.events : []);
+    const action = beginAction();
+    if (action === null) return;
+    const r = await api.getCardEvents(action.key, threadId);
+    if (action.isCurrent() && drawerRef.current === threadId) setDrawerEvents(r.ok ? r.events : []);
   };
 
-  const onEvents = (events: UiEvent[], info: { initial: boolean; gap: boolean }): void => {
+  function onEvents(events: UiEvent[], info: { initial: boolean; gap: boolean }): void {
     const now = Date.now();
     ownRef.current = pruneOwnActions(ownRef.current, now);
     toast(eventsToToasts(events, { ...info, own: ownRef.current, now }));
     const open = drawerRef.current;
     if (open !== null && events.some((e) => e.threadId === open)) void loadDrawerEvents(open);
-  };
+  }
 
-  // 操作が終わったら、溜めていた最新の snapshot を取り込む
-  useEffect(() => {
-    if (busy) return;
-    const gate = releaseSnapshot(pendingRef.current, false);
-    pendingRef.current = gate.pending;
+  function onRelease(next: BoardResponse | null): void {
     const thread = interactionRef.current;
     interactionRef.current = null;
-    if (gate.apply === null) return;
+    if (next === null) return;
     const ownMove = thread !== null && ownRef.current.some((o) => o.threadId === thread && o.expiresAt >= Date.now());
     if (thread !== null && !ownMove) {
-      const notice = grabbedCardNotice(respRef.current, gate.apply, thread);
+      const notice = grabbedCardNotice(current(), next, thread);
       if (notice !== null) toast([{ text: notice, persistent: false }]);
     }
-    applySnapshot(gate.apply, true);
-  }, [busy]);
+  }
 
   // モーダルが閉じたら、溜めていたトーストをまとめて出す
   useEffect(() => {
     if (!modalOpen) setToasts((s) => releaseHeldToasts(s));
   }, [modalOpen]);
 
-  // ------------------------------------------------------------ 起動とボードの切り替え
+  function onBoardChange(): void {
+    setSelected(null);
+    setFocusColumn(null);
+    interactionRef.current = null;
+    rollbackRef.current = null;
+    moveActionRef.current = null;
+    setGrab(null);
+    setDrag(null);
+    setFlow(null);
+    setSending(false);
+    setDrawerPending(false);
+    setDrawer(null);
+    setDrawerEvents(null);
+    setDrawerOptions(null);
+    setHighlighted(new Set());
+  }
 
-  /** isCancelled: health を確かめている間に別のボードへ切り替えたら true（前のボードの案内を出さない）。 */
-  const handleLoadFailure = async (r: ApiFailure, isCancelled: () => boolean = () => false): Promise<void> => {
-    if (r.status === 403) {
-      const decision = decideDisconnect(classifyDisconnect(await api.getHealth()), 0);
-      if (isCancelled()) return;
-      setBanner(decision.banner === 'reauth' ? 'reauth' : 'unavailable');
-      return;
-    }
-    setBanner('unavailable');
-  };
-
-  const loadBoards = async (): Promise<void> => {
-    const r = await api.getBoards();
-    if (!r.ok) {
-      await handleLoadFailure(r);
-      return;
-    }
-    setBanner(null);
-    setBoards(r.boards);
-    setKey(parseHashKey(location.hash) ?? r.defaultKey ?? r.boards[0]?.key ?? null);
-    setLoaded(true);
-  };
-
-  useEffect(() => {
-    void loadBoards();
-    const onHash = (): void => {
-      const k = parseHashKey(location.hash);
-      if (k !== null && k !== keyRef.current) setKey(k);
-    };
-    window.addEventListener('hashchange', onHash);
-    const unwatch = platform.watchMedia(NARROW_QUERY, setNarrow);
-    return () => {
-      window.removeEventListener('hashchange', onHash);
-      unwatch();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (key === null) return undefined;
-    if (shownKeyRef.current !== key) {
-      // 別のボードに切り替えたら、前のボードの表示と操作の途中の状態をすぐに捨てる
-      // （新しいボードの取得を待つ間や失敗したときに、前のボードのカードを操作させない）
-      shownKeyRef.current = key;
-      genRef.current += 1;
-      setResp(null);
-      setSelected(null);
-      setFocusColumn(null);
-      pendingRef.current = null;
-      interactionRef.current = null;
-      rollbackRef.current = null;
-      moveKeyRef.current = null;
-      setGrab(null);
-      setDrag(null);
-      setFlow(null);
-      // 前のボードの送信は世代が変わったので結果を反映しない。新しいボードの操作を止めないように送信中も解除する
-      setSending(false);
-      setDrawerPending(false);
-      setDrawer(null);
-      setDrawerEvents(null);
-      setDrawerOptions(null);
-      setHighlighted(new Set());
-    }
-    let cancelled = false;
-    let handle: StreamHandle | null = null;
-    if (parseHashKey(location.hash) !== key) history.replaceState(null, '', `#board=${encodeURIComponent(key)}`);
-    void (async () => {
-      const r = await api.getBoard(key);
-      if (cancelled) return;
-      if (!r.ok) {
-        await handleLoadFailure(r, () => cancelled);
-        return;
-      }
-      setBanner(null);
-      pendingRef.current = null;
-      applySnapshot(r, false);
-      handle = openStream(key, r.lastEventId, { onEvents, onSnapshot, onBanner: setBanner });
-      streamRef.current = handle;
-    })();
-    return () => {
-      cancelled = true;
-      handle?.close();
-      streamRef.current = null;
-    };
-  }, [key, reloadToken]);
-
-  const onRetry = (): void => {
-    setBanner(null);
-    if (streamRef.current !== null) streamRef.current.retryNow();
-    else if (!loaded) void loadBoards();
-    else setReloadToken((n) => n + 1);
-  };
+  useEffect(() => platform.watchMedia(NARROW_QUERY, setNarrow), []);
 
   // ------------------------------------------------------------ フォーカス
 
-  // 描画のたびに、フォーカスがボードの中か body にあれば選択中のカードへ戻す（commit を待つ view transition もここで解決する）
+  // 描画のたびに、フォーカスがボードの中か body にあれば選択中のカードへ戻す
   useLayoutEffect(() => {
-    for (const resolve of commitWaiters.current.splice(0)) resolve();
     const container = boardRef.current;
     const board = resp?.board ?? null;
     if (container === null || board === null) return;
@@ -364,37 +214,21 @@ export function App(): JSX.Element {
 
   // ------------------------------------------------------------ 移動
 
-  /** 移動の前の snapshot を捨てたときに、移動を反映したボードを取り直す。 */
-  const refetchAfterMove = async (k: BoardKey, gen: number, watermark: number): Promise<void> => {
-    const r = await api.getBoard(k);
-    if (genRef.current !== gen || !r.ok || r.lastEventId < watermark) return;
-    // 取り直しの間に SSE で同じか新しい snapshot が届いていれば、そちらを優先する
-    const latest = pendingRef.current ?? respRef.current;
-    if (latest !== null && r.lastEventId <= latest.lastEventId) return;
-    onSnapshot(r);
-  };
-
-  const send = async (k: BoardKey, threadId: string, cardId: number, link: string | null, option: MoveOption, reason: string | undefined): Promise<void> => {
+  const send = async (action: BoardAction, threadId: string, cardId: number, link: string | null, option: MoveOption, reason: string | undefined): Promise<void> => {
     setSending(true);
-    const gen = genRef.current;
     const own = markOwnAction(threadId);
-    const r = await api.postMove(k, threadId, buildMoveBody(option, reason));
-    if (genRef.current !== gen || keyRef.current !== k) {
+    const r = await api.postMove(action.key, threadId, buildMoveBody(option, reason));
+    if (!action.isCurrent()) {
       // 送信中に別のボードへ切り替えた（戻ってきた場合も含む）。前のボードの表示へ戻したりダイアログを出したりせず、
       // 送信中の状態（切り替えで解除済み。新しいボードの送信中かもしれない）にも触れない
       if (!r.ok) unmarkOwnAction(own);
       return;
     }
     if (r.ok) {
-      // 溜めた snapshot は、自分の移動のイベント位置（応答の lastEventId）以上のものだけを取り込む。
-      // 応答に lastEventId がなければ、溜めた snapshot が移動を含むか判定できないので捨てて取り直す
-      const watermark = r.lastEventId;
-      const before = pendingRef.current;
-      pendingRef.current = watermark === undefined ? null : pendingAfterMove(before, watermark);
       setSending(false);
       platform.announce(`#${cardId} を ${option.column} へ移動しました`, 500);
       if (r.t3Action !== null) toast([settleToast(r.t3Action, cardId, link)]);
-      if (watermark === undefined || (before !== null && pendingRef.current === null)) void refetchAfterMove(k, gen, watermark ?? 0);
+      reconcileMove(action, r.lastEventId);
       return;
     }
     // 失敗したら元に戻し、ダイアログで理由を示す
@@ -417,10 +251,10 @@ export function App(): JSX.Element {
   const startMove = (threadId: string, option: MoveOption): void => {
     // 送信中の移動と rollbackRef / sending を共有するので、重ねて始めない
     if (sendingRef.current) return;
-    const k = actionKey();
-    const current = respRef.current;
-    const card = cardOf(current, threadId);
-    if (k === null || current === null || card === null) return;
+    const action = beginAction();
+    const snapshot = current();
+    const card = cardOf(snapshot, threadId);
+    if (action === null || snapshot === null || card === null) return;
     if (!option.allowed) {
       const text = `#${card.cardId} は ${option.column} に移動できません: ${errorLabel(option.code)}`;
       platform.announce(text);
@@ -428,13 +262,13 @@ export function App(): JSX.Element {
       return;
     }
     interactionRef.current = threadId;
-    rollbackRef.current = current;
-    moveKeyRef.current = k;
-    setResp(applyOptimisticMove(current, threadId, option.column));
+    rollbackRef.current = snapshot;
+    moveActionRef.current = action;
+    setResp(applyOptimisticMove(snapshot, threadId, option.column));
     const steps = moveSteps(option);
     const first = steps[0];
     if (first === undefined) {
-      void send(k, threadId, card.cardId, card.t3?.link ?? null, option, undefined);
+      void send(action, threadId, card.cardId, card.t3?.link ?? null, option, undefined);
       return;
     }
     setFlow({ seq: ++seqRef.current, threadId, cardId: card.cardId, title: card.title, option, steps, step: first });
@@ -449,12 +283,12 @@ export function App(): JSX.Element {
 
   const onConfirm = (reason: string | undefined): void => {
     const f = flowRef.current;
-    const k = moveKeyRef.current;
-    if (f === null || k === null || k !== actionKey()) return;
+    const action = moveActionRef.current;
+    if (f === null || action === null || !action.isCurrent()) return;
     const card = cardOf(rollbackRef.current, f.threadId);
     setSending(true);
     setFlow(null);
-    void send(k, f.threadId, f.cardId, card?.t3?.link ?? null, f.option, reason);
+    void send(action, f.threadId, f.cardId, card?.t3?.link ?? null, f.option, reason);
   };
 
   const onCancelDialog = (): void => {
@@ -469,11 +303,10 @@ export function App(): JSX.Element {
 
   /** 移動先の判定。取得できなければ null、取得の間に別のボードへ切り替えたら 'stale'（呼び出し側は何もしない）。 */
   const fetchOptions = async (threadId: string): Promise<MoveOption[] | null | 'stale'> => {
-    const k = actionKey();
-    if (k === null) return null;
-    const gen = genRef.current;
-    const r = await api.getMoveOptions(k, threadId);
-    if (genRef.current !== gen) return 'stale';
+    const action = beginAction();
+    if (action === null) return null;
+    const r = await api.getMoveOptions(action.key, threadId);
+    if (!action.isCurrent()) return 'stale';
     return r.ok ? r.options : null;
   };
 
@@ -481,9 +314,9 @@ export function App(): JSX.Element {
 
   const startGrab = (threadId: string): void => {
     if (isBusy()) return;
-    const board = respRef.current?.board;
+    const board = current()?.board;
     const pos = board == null ? null : findCard(board, threadId);
-    const card = cardOf(respRef.current, threadId);
+    const card = cardOf(current(), threadId);
     if (pos === null || card === null) return;
     interactionRef.current = threadId;
     setGrab({ threadId, from: pos.col, target: pos.col, options: null });
@@ -506,7 +339,7 @@ export function App(): JSX.Element {
   };
 
   const dropGrab = (g: GrabState): void => {
-    const board = respRef.current?.board;
+    const board = current()?.board;
     if (board == null) return;
     if (g.target === g.from) {
       cancelGrab();
@@ -524,7 +357,7 @@ export function App(): JSX.Element {
 
   const collectRects = (): Record<string, VRect> => {
     const rects: Record<string, VRect> = {};
-    for (const col of respRef.current?.board?.columns ?? []) {
+    for (const col of current()?.board?.columns ?? []) {
       for (const c of col.cards) {
         const r = platform.rect(document.getElementById(cardElementId(c.cardId)));
         rects[c.threadId] = { top: r.top, bottom: r.bottom };
@@ -535,7 +368,7 @@ export function App(): JSX.Element {
 
   const onCardKeyDown = (ev: TargetedKeyboardEvent<HTMLElement>, threadId: string): void => {
     if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
-    const board = respRef.current?.board;
+    const board = current()?.board;
     if (board == null) return;
     const g = grabRef.current;
     if (g !== null) {
@@ -579,7 +412,7 @@ export function App(): JSX.Element {
   const onBoardFocusOut = (ev: TargetedFocusEvent<HTMLDivElement>): void => {
     const g = grabRef.current;
     if (g === null) return;
-    const card = cardOf(respRef.current, g.threadId);
+    const card = cardOf(current(), g.threadId);
     const el = card === null ? null : document.getElementById(cardElementId(card.cardId));
     const next = ev.relatedTarget;
     if (el !== null && next instanceof Node && el.contains(next)) return;
@@ -592,7 +425,7 @@ export function App(): JSX.Element {
   };
 
   const onColumnFocus = (column: Column): void => {
-    const col = respRef.current?.board?.columns.find((c) => c.column === column);
+    const col = current()?.board?.columns.find((c) => c.column === column);
     const first = col?.cards[0];
     if (first !== undefined) {
       setSelected(first.threadId);
@@ -605,7 +438,7 @@ export function App(): JSX.Element {
 
   const onSelectTab = (column: Column): void => {
     setActiveColumn(column);
-    const first = respRef.current?.board?.columns.find((c) => c.column === column)?.cards[0];
+    const first = current()?.board?.columns.find((c) => c.column === column)?.cards[0];
     setSelected(first?.threadId ?? null);
     setFocusColumn(first === undefined ? column : null);
   };
@@ -662,7 +495,7 @@ export function App(): JSX.Element {
       platform.announce('移動を取り消しました');
       return;
     }
-    const board = respRef.current?.board;
+    const board = current()?.board;
     const from = board == null ? null : findCard(board, d.threadId)?.column;
     if (d.over === null || d.over === from) return;
     if (d.options === null) {
@@ -675,7 +508,7 @@ export function App(): JSX.Element {
 
   const onHandlePointerDown = (ev: TargetedPointerEvent<HTMLElement>, threadId: string): void => {
     if (ev.button !== 0 || isBusy()) return;
-    const card = cardOf(respRef.current, threadId);
+    const card = cardOf(current(), threadId);
     if (card === null) return;
     ev.preventDefault();
     ev.stopPropagation();
@@ -756,12 +589,11 @@ export function App(): JSX.Element {
     forceFocusRef.current = true;
   };
 
-  const runCardAction = async (k: BoardKey, threadId: string, action: () => Promise<{ ok: true } | ApiFailure>, done: string): Promise<void> => {
+  const runCardAction = async (action: BoardAction, threadId: string, request: () => Promise<{ ok: true } | ApiFailure>, done: string): Promise<void> => {
     setDrawerPending(true);
     const own = markOwnAction(threadId);
-    const gen = genRef.current;
-    const r = await action();
-    if (genRef.current !== gen || keyRef.current !== k) {
+    const r = await request();
+    if (!action.isCurrent()) {
       // 送信中に別のボードへ切り替えた。前のボードの結果は知らせない（送信中の表示は切り替えたときに解除済み。新しいボードの送信中を消さない）
       if (!r.ok) unmarkOwnAction(own);
       return;
@@ -777,16 +609,16 @@ export function App(): JSX.Element {
 
   const onBlock = (reason: string): void => {
     const threadId = drawerRef.current;
-    const k = actionKey();
-    if (threadId === null || k === null) return;
-    void runCardAction(k, threadId, () => api.postBlock(k, threadId, reason), 'ブロックしました');
+    const action = beginAction();
+    if (threadId === null || action === null) return;
+    void runCardAction(action, threadId, () => api.postBlock(action.key, threadId, reason), 'ブロックしました');
   };
 
   const onUnblock = (): void => {
     const threadId = drawerRef.current;
-    const k = actionKey();
-    if (threadId === null || k === null) return;
-    void runCardAction(k, threadId, () => api.postUnblock(k, threadId), 'ブロックを解除しました');
+    const action = beginAction();
+    if (threadId === null || action === null) return;
+    void runCardAction(action, threadId, () => api.postUnblock(action.key, threadId), 'ブロックを解除しました');
   };
 
   const onRequestOptions = (): void => {
@@ -816,11 +648,9 @@ export function App(): JSX.Element {
         currentKey={key}
         resp={resp}
         recent={toasts.recent}
-        onSwitch={(k) => {
-          if (k !== keyRef.current) setKey(k);
-        }}
+        onSwitch={selectBoard}
       />
-      <BannerView banner={banner} onRetry={onRetry} />
+      <BannerView banner={banner} onRetry={retry} />
       <main class="main">
         {resp === null ? (
           loaded && key === null ? (
