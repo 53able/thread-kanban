@@ -2,9 +2,11 @@ import { McpServer, type CallToolResult } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 import { buildBoardView, computeMetrics, type BoardView, type Metrics } from './domain/metrics.js';
 import { recommendNext, type NextRecommendation } from './domain/next.js';
+import { blockCard, toBlockResponse, toUnblockResponse, unblockCard } from './app/block.js';
 import { addCard } from './app/card-add.js';
+import { moveCard, toMoveResponse } from './app/move.js';
 import { MAX_REPORTED_DEVIATIONS, syncBoard, type SyncResult } from './app/sync.js';
-import { t3ActionForMove } from './domain/sync.js';
+import { resolveThreadId } from './app/thread-id.js';
 import {
   ALL_COLUMNS,
   BOARD_COLUMNS,
@@ -12,8 +14,6 @@ import {
   SERVICE_CLASSES,
   SIZES,
   WORK_TYPES,
-  fail,
-  isValidThreadId,
   systemClock,
   type Card,
   type Clock,
@@ -178,21 +178,7 @@ export function createKanbanServer(options: ServerOptions): McpServer {
 
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
-  const withThread = (threadId: string | undefined): Result<string> => {
-    const id = threadId ?? defaultThreadId;
-    if (id === undefined || id === '') {
-      return fail(
-        'THREAD_ID_REQUIRED',
-        'threadId を指定してください（または環境変数 KANBAN_THREAD_ID / T3CODE_THREAD_ID を設定してください）',
-      );
-    }
-    if (!isValidThreadId(id)) {
-      return fail('INVALID_ARGUMENT', 'threadId は英数字で始まり、英数字と . _ : - だけの 128 文字以内にしてください', {
-        threadId: id.slice(0, 200),
-      });
-    }
-    return { ok: true, value: id };
-  };
+  const withThread = (threadId: string | undefined): Result<string> => resolveThreadId(threadId, defaultThreadId);
 
   server.registerTool(
     'kanban_board_get',
@@ -320,31 +306,12 @@ export function createKanbanServer(options: ServerOptions): McpServer {
     async ({ threadId, ...input }) => {
       const id = withThread(threadId);
       if (!id.ok) return failure(id.error);
-      const result = store.moveCard(id.value, input);
+      const result = moveCard({ store, threadId: id.value, input, t3Available: t3.available() });
       if (!result.ok) return failure(result.error);
-      const { card, decision } = result.value;
-      const notes = [
-        decision.violation !== null
-          ? `WIP 違反を記録しました（${decision.violation.column} 上限 ${decision.violation.limit}、理由: ${decision.violation.reason}）`
-          : null,
-        decision.expediteOverLimit ? 'expedite のため WIP 上限を超えて移動しました' : null,
-      ].filter((x): x is string => x !== null);
-      // ボード → T3 の反映。T3 CLI に settle はないので、エージェントへの提案として返す
-      const t3Action = t3ActionForMove(decision.from, decision.to, card.threadId, card.t3 !== null || t3.available());
-      if (t3Action !== null) {
-        notes.push(`T3 側: ${t3Action.tool} で ${t3Action.args.action} する（T3 は Not Done / Done だけを持つ）`);
-      }
+      const { card, decision, notes } = result.value;
       return success(
         [`${decision.from} → ${decision.to}: ${cardLine(card)}`, ...notes].join('\n'),
-        {
-          card,
-          from: decision.from,
-          to: decision.to,
-          direction: decision.direction,
-          violation: decision.violation,
-          expediteOverLimit: decision.expediteOverLimit,
-          t3Action,
-        },
+        { ...toMoveResponse(result.value) },
       );
     },
   );
@@ -358,9 +325,9 @@ export function createKanbanServer(options: ServerOptions): McpServer {
     async ({ threadId, reason }) => {
       const id = withThread(threadId);
       if (!id.ok) return failure(id.error);
-      const result = store.blockCard(id.value, reason);
+      const result = blockCard({ store, threadId: id.value, input: { reason }, t3Available: t3.available() });
       if (!result.ok) return failure(result.error);
-      return success(`ブロックしました: ${cardLine(result.value)}`, { card: result.value });
+      return success(`ブロックしました: ${cardLine(result.value.card)}`, { ...toBlockResponse(result.value) });
     },
   );
 
@@ -373,13 +340,10 @@ export function createKanbanServer(options: ServerOptions): McpServer {
     async ({ threadId, resolution }) => {
       const id = withThread(threadId);
       if (!id.ok) return failure(id.error);
-      const result = store.unblockCard(id.value, resolution);
+      const result = unblockCard({ store, threadId: id.value, input: { resolution }, t3Available: t3.available() });
       if (!result.ok) return failure(result.error);
-      const days = Math.round(result.value.blockedDays * 100) / 100;
-      return success(`ブロックを解除しました（${days} 日）: ${cardLine(result.value.card)}`, {
-        card: result.value.card,
-        blockedDays: days,
-      });
+      const response = toUnblockResponse(result.value);
+      return success(`ブロックを解除しました（${response.blockedDays} 日）: ${cardLine(response.card)}`, { ...response });
     },
   );
 

@@ -17,5 +17,6 @@
     "rootDir": ".",
     "outDir": "dist"
   },
-  "include": ["src", "tests", "vitest.config.ts"]
+  "include": ["src", "tests", "vitest.config.ts"],
+  "exclude": ["ui", "tests/ui-dom"]
 }
