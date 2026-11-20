@@ -63,6 +63,27 @@ export interface MoveCardInput {
   force?: boolean | undefined;
   reason?: string | undefined;
   criteriaConfirmed?: boolean | undefined;
+  /** 操作した主体（UI なら 'ui'）。この操作で発生する全イベントの data.actor に記録する */
+  actor?: string | undefined;
+}
+
+export interface ActorOptions {
+  /** 操作した主体（UI なら 'ui'）。この操作で発生する全イベントの data.actor に記録する */
+  actor?: string | undefined;
+}
+
+export interface ReaderOptions {
+  path: string;
+  boardId: string;
+  /** 他プロセスがロック中のときに待つ最大時間（ミリ秒） */
+  busyTimeoutMs?: number;
+}
+
+/** DB に入っているボード（KanbanReader.listBoards の戻り値） */
+export interface StoredBoard {
+  boardId: string;
+  /** v2 の DB（base_path 列なし）や未設定なら null */
+  basePath: string | null;
 }
 
 export interface ConfigureInput {
@@ -108,6 +129,29 @@ function rowToEvent(r: Row): KanbanEvent {
   };
 }
 
+function actorData(actor: string | undefined): Record<string, unknown> {
+  return actor !== undefined ? { actor } : {};
+}
+
+/** ボードの設定。ボードの行がなければ null。 */
+function loadConfig(db: DatabaseSync, boardId: string): BoardConfig | null {
+  const board = db.prepare('SELECT stale_days FROM boards WHERE id = ?').get(boardId) as Row | undefined;
+  if (board === undefined) return null;
+  const columns = (db.prepare('SELECT * FROM columns WHERE board_id = ? ORDER BY position').all(boardId) as Row[]).map(
+    (r) => ({
+      name: String(r.name) as BoardColumn,
+      position: Number(r.position),
+      wipLimit: r.wip_limit === null ? null : Number(r.wip_limit),
+      entryCriteria: JSON.parse(String(r.entry_criteria)) as string[],
+    }),
+  );
+  return { id: boardId, staleDays: Number(board.stale_days), columns };
+}
+
+function loadCards(db: DatabaseSync, boardId: string): Card[] {
+  return (db.prepare('SELECT * FROM cards WHERE board_id = ? ORDER BY id').all(boardId) as Row[]).map(rowToCard);
+}
+
 /**
  * SQLite（node:sqlite）によるボードの永続化。
  * 書き込みは全て BEGIN IMMEDIATE で直列化し、読み取り→判定→書き込みを 1 トランザクションで行う。
@@ -131,13 +175,19 @@ export class KanbanStore {
     if (options.path !== ':memory:') mkdirSync(dirname(options.path), { recursive: true });
     const timeout = options.busyTimeoutMs ?? 10_000;
     const db = new DatabaseSync(options.path, { timeout });
-    db.exec(`PRAGMA busy_timeout = ${timeout}`);
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec('PRAGMA synchronous = NORMAL');
-    db.exec('PRAGMA foreign_keys = ON');
-    const store = new KanbanStore(db, options);
-    store.init();
-    return store;
+    try {
+      db.exec(`PRAGMA busy_timeout = ${timeout}`);
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('PRAGMA synchronous = NORMAL');
+      db.exec('PRAGMA foreign_keys = ON');
+      const store = new KanbanStore(db, options);
+      store.init();
+      return store;
+    } catch (error) {
+      // 初期化に失敗した（ロック中など）接続を残さない
+      db.close();
+      throw error;
+    }
   }
 
   /** 2 回呼んでもよい。close 後の読み書きは例外にする（S4: 終了後に書き込まない）。 */
@@ -180,6 +230,8 @@ export class KanbanStore {
   private migrate(): void {
     const columns = (this.db.prepare('PRAGMA table_info(cards)').all() as Row[]).map((r) => String(r.name));
     if (!columns.includes('t3')) this.db.exec('ALTER TABLE cards ADD COLUMN t3 TEXT');
+    const boardColumns = (this.db.prepare('PRAGMA table_info(boards)').all() as Row[]).map((r) => String(r.name));
+    if (!boardColumns.includes('base_path')) this.db.exec('ALTER TABLE boards ADD COLUMN base_path TEXT');
     const current = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version);
     this.db.exec(`PRAGMA user_version = ${Math.max(current, SCHEMA_VERSION)}`);
   }
@@ -212,23 +264,13 @@ export class KanbanStore {
     }
   }
 
+  /** init() でボードの行を作るので、KanbanStore では常に存在する。 */
   private loadConfig(): BoardConfig {
-    const board = this.db.prepare('SELECT stale_days FROM boards WHERE id = ?').get(this.boardId) as Row;
-    const columns = (
-      this.db.prepare('SELECT * FROM columns WHERE board_id = ? ORDER BY position').all(this.boardId) as Row[]
-    ).map((r) => ({
-      name: String(r.name) as BoardColumn,
-      position: Number(r.position),
-      wipLimit: r.wip_limit === null ? null : Number(r.wip_limit),
-      entryCriteria: JSON.parse(String(r.entry_criteria)) as string[],
-    }));
-    return { id: this.boardId, staleDays: Number(board.stale_days), columns };
+    return loadConfig(this.db, this.boardId) as BoardConfig;
   }
 
   private loadCards(): Card[] {
-    return (
-      this.db.prepare('SELECT * FROM cards WHERE board_id = ? ORDER BY id').all(this.boardId) as Row[]
-    ).map(rowToCard);
+    return loadCards(this.db, this.boardId);
   }
 
   private loadCard(threadId: string): Card | null {
@@ -280,6 +322,22 @@ export class KanbanStore {
             .prepare('SELECT * FROM events WHERE board_id = ? AND at <= ? ORDER BY at, id')
             .all(this.boardId, range.to);
     return (rows as Row[]).map(rowToEvent);
+  }
+
+  /** boards.base_path（boardId の元になったパス）。 */
+  getBasePath(): string | null {
+    return this.read(() => {
+      const r = this.db.prepare('SELECT base_path FROM boards WHERE id = ?').get(this.boardId) as Row | undefined;
+      return r === undefined || r.base_path === null ? null : String(r.base_path);
+    });
+  }
+
+  /** boards.base_path を設定する。イベントは記録しない。 */
+  setBasePath(path: string | null): void {
+    this.immediate(() => {
+      this.db.prepare('UPDATE boards SET base_path = ? WHERE id = ?').run(path, this.boardId);
+      return ok(null);
+    });
   }
 
   /** メトリクス用に、カードと to 以前のイベントを同一スナップショットで返す。 */
@@ -453,22 +511,27 @@ export class KanbanStore {
         ...(input.reason !== undefined ? { reason: input.reason } : {}),
         ...(input.criteriaConfirmed === true ? { criteriaConfirmed: true } : {}),
         ...(decision.expediteOverLimit ? { expediteOverLimit: true } : {}),
+        ...actorData(input.actor),
       });
       if (decision.violation !== null) {
-        this.insertEvent(card.id, 'wip_violation', decision.from, decision.to, now, { ...decision.violation });
+        this.insertEvent(card.id, 'wip_violation', decision.from, decision.to, now, {
+          ...decision.violation,
+          ...actorData(input.actor),
+        });
       }
       if (decision.to === DISCARDED && card.blocked !== null) {
         this.db.prepare('UPDATE cards SET blocked_reason = NULL, blocked_since = NULL WHERE id = ?').run(card.id);
         this.insertEvent(card.id, 'unblocked', null, null, now, {
           resolution: 'discarded',
           blockedDays: (now - card.blocked.since) / DAY_MS,
+          ...actorData(input.actor),
         });
       }
       return ok({ card: this.loadCard(threadId) as Card, decision });
     });
   }
 
-  blockCard(threadId: string, reason: string): Result<Card> {
+  blockCard(threadId: string, reason: string, options?: ActorOptions): Result<Card> {
     const now = this.clock();
     return this.immediate(() => {
       const card = this.loadCard(threadId);
@@ -485,12 +548,16 @@ export class KanbanStore {
       this.db
         .prepare('UPDATE cards SET blocked_reason = ?, blocked_since = ?, updated_at = ? WHERE id = ?')
         .run(reason, now, now, card.id);
-      this.insertEvent(card.id, 'blocked', card.column, card.column, now, { reason });
+      this.insertEvent(card.id, 'blocked', card.column, card.column, now, { reason, ...actorData(options?.actor) });
       return ok(this.loadCard(threadId) as Card);
     });
   }
 
-  unblockCard(threadId: string, resolution?: string): Result<{ card: Card; blockedDays: number }> {
+  unblockCard(
+    threadId: string,
+    resolution?: string,
+    options?: ActorOptions,
+  ): Result<{ card: Card; blockedDays: number }> {
     const now = this.clock();
     return this.immediate(() => {
       const card = this.loadCard(threadId);
@@ -504,8 +571,184 @@ export class KanbanStore {
         reason: card.blocked.reason,
         blockedDays,
         ...(resolution !== undefined ? { resolution } : {}),
+        ...actorData(options?.actor),
       });
       return ok({ card: this.loadCard(threadId) as Card, blockedDays });
     });
+  }
+}
+
+/** KanbanReader.readSince の戻り値。全て同じ読み取りトランザクションで取得する。 */
+export interface ReaderBatch {
+  /** ボードの行（またはテーブル）がなければ null */
+  snapshot: { board: BoardConfig; cards: Card[] } | null;
+  /** id より後のイベント（id 昇順、最大 limit 件） */
+  events: KanbanEvent[];
+  /** limit を超えるイベントがあった */
+  truncated: boolean;
+  /** このボードのイベント id の最大値（イベントがなければ 0） */
+  maxEventId: number;
+}
+
+/**
+ * 読み取り専用の接続（UI 用）。init() を呼ばず、スキーマの作成・移行・ボードの行の追加をしない。
+ * 閲覧だけで DB を書き換えないため、readOnly で開く。
+ */
+export class KanbanReader {
+  readonly boardId: string;
+  readonly path: string;
+  private readonly db: DatabaseSync;
+  private closed = false;
+
+  private constructor(db: DatabaseSync, options: ReaderOptions) {
+    this.db = db;
+    this.boardId = options.boardId;
+    this.path = options.path;
+  }
+
+  /** ファイルがなければ例外。node:sqlite の timeout オプションは readOnly では効かないので PRAGMA で設定する。 */
+  static open(options: ReaderOptions): KanbanReader {
+    const db = new DatabaseSync(options.path, { readOnly: true });
+    try {
+      db.exec(`PRAGMA busy_timeout = ${options.busyTimeoutMs ?? 2000}`);
+    } catch (e) {
+      db.close();
+      throw e;
+    }
+    return new KanbanReader(db, options);
+  }
+
+  /**
+   * DB にあるボードの一覧を読み取り専用で返す。
+   * boards テーブルがない・開けない・SQLite でないファイルは空配列。v2 の DB（base_path 列なし）は basePath: null。
+   */
+  static listBoards(path: string, busyTimeoutMs = 2000): StoredBoard[] {
+    let db: DatabaseSync;
+    try {
+      db = new DatabaseSync(path, { readOnly: true });
+    } catch {
+      return [];
+    }
+    try {
+      db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+      const columns = (db.prepare('PRAGMA table_info(boards)').all() as Row[]).map((r) => String(r.name));
+      if (columns.length === 0) return [];
+      const hasBasePath = columns.includes('base_path');
+      const rows = db
+        .prepare(`SELECT id${hasBasePath ? ', base_path' : ''} FROM boards ORDER BY created_at, id`)
+        .all() as Row[];
+      return rows.map((r) => ({
+        boardId: String(r.id),
+        basePath: hasBasePath && r.base_path !== null && r.base_path !== undefined ? String(r.base_path) : null,
+      }));
+    } catch {
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.db.close();
+  }
+
+  isClosed(): boolean {
+    return this.closed;
+  }
+
+  private read<T>(fn: () => T): T {
+    if (this.closed) throw new Error('KanbanReader は閉じられています');
+    this.db.exec('BEGIN');
+    try {
+      return fn();
+    } finally {
+      this.db.exec('COMMIT');
+    }
+  }
+
+  /** スキーマがまだない DB（MCP が作成中のファイルなど）では false。 */
+  private hasSchema(): boolean {
+    const r = this.db
+      .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN ('boards', 'columns', 'cards', 'events')")
+      .get() as Row;
+    return Number(r.n) === 4;
+  }
+
+  private loadSnapshot(): { board: BoardConfig; cards: Card[] } | null {
+    if (!this.hasSchema()) return null;
+    const board = loadConfig(this.db, this.boardId);
+    return board === null ? null : { board, cards: loadCards(this.db, this.boardId) };
+  }
+
+  private loadEventsSince(id: number, limit: number): { events: KanbanEvent[]; truncated: boolean } {
+    if (!this.hasSchema()) return { events: [], truncated: false };
+    const rows = this.db
+      .prepare('SELECT * FROM events WHERE board_id = ? AND id > ? ORDER BY id LIMIT ?')
+      .all(this.boardId, id, limit + 1) as Row[];
+    const truncated = rows.length > limit;
+    return { events: rows.slice(0, limit).map(rowToEvent), truncated };
+  }
+
+  private loadMaxEventId(): number {
+    if (!this.hasSchema()) return 0;
+    const r = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE board_id = ?').get(this.boardId) as Row;
+    return Number(r.id);
+  }
+
+  /** ボードの設定とカード。ボードの行がなければ null。 */
+  snapshot(): { board: BoardConfig; cards: Card[] } | null {
+    return this.read(() => this.loadSnapshot());
+  }
+
+  /** threadId のカードのイベント（id 昇順）。カードがなければ空配列。 */
+  listCardEvents(threadId: string): KanbanEvent[] {
+    return this.read(() => {
+      if (!this.hasSchema()) return [];
+      const rows = this.db
+        .prepare(
+          `SELECT e.* FROM events e JOIN cards c ON c.id = e.card_id
+           WHERE e.board_id = ? AND c.board_id = ? AND c.thread_id = ? ORDER BY e.id`,
+        )
+        .all(this.boardId, this.boardId, threadId) as Row[];
+      return rows.map(rowToEvent);
+    });
+  }
+
+  /** id より後のこのボードのイベント（id 昇順、最大 limit 件）。limit を超えていれば truncated: true。 */
+  listEventsSince(id: number, limit: number): { events: KanbanEvent[]; truncated: boolean } {
+    return this.read(() => this.loadEventsSince(id, limit));
+  }
+
+  /** このボードのイベント id の最大値（イベントがなければ 0）。 */
+  maxEventId(): number {
+    return this.read(() => this.loadMaxEventId());
+  }
+
+  /** snapshot・id より後のイベント・最大のイベント id を、同じ読み取りトランザクションで返す。 */
+  readSince(id: number, limit: number): ReaderBatch {
+    return this.read(() => {
+      const { events, truncated } = this.loadEventsSince(id, limit);
+      return { snapshot: this.loadSnapshot(), events, truncated, maxEventId: this.loadMaxEventId() };
+    });
+  }
+
+  /** boards.base_path（v2 の DB で列がない・ボードの行がない・未設定なら null）。 */
+  basePath(): string | null {
+    return this.read(() => {
+      if (!this.hasSchema()) return null;
+      const columns = (this.db.prepare('PRAGMA table_info(boards)').all() as Row[]).map((r) => String(r.name));
+      if (!columns.includes('base_path')) return null;
+      const r = this.db.prepare('SELECT base_path FROM boards WHERE id = ?').get(this.boardId) as Row | undefined;
+      return r === undefined || r.base_path === null ? null : String(r.base_path);
+    });
+  }
+
+  /** PRAGMA data_version。他の接続がコミットすると値が変わる。 */
+  dataVersion(): number {
+    if (this.closed) throw new Error('KanbanReader は閉じられています');
+    const r = this.db.prepare('PRAGMA data_version').get() as Row;
+    return Number(r.data_version);
   }
 }

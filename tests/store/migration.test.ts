@@ -208,3 +208,68 @@ describe('close 後（S4）', () => {
     reopened.close();
   });
 });
+
+/** SCHEMA_VERSION 2（cards.t3 あり、boards.base_path なし） */
+const V2_SQL = V1_SQL.replace("external_refs TEXT NOT NULL DEFAULT '[]', column_name", "external_refs TEXT NOT NULL DEFAULT '[]', t3 TEXT, column_name").replace(
+  'PRAGMA user_version = 1;',
+  'PRAGMA user_version = 2;',
+);
+
+function boardColumns(): string[] {
+  const db = new DatabaseSync(path);
+  try {
+    return (db.prepare('PRAGMA table_info(boards)').all() as { name: string }[]).map((r) => r.name);
+  } finally {
+    db.close();
+  }
+}
+
+describe('スキーマ移行 v2 → v3（boards.base_path）', () => {
+  it('v2 の DB を開くと base_path 列が追加され、既存のボード・カードが残り、user_version が 3 になる', () => {
+    const raw = new DatabaseSync(path);
+    raw.exec(V2_SQL);
+    raw.close();
+    expect(boardColumns()).not.toContain('base_path');
+
+    const store = open();
+    try {
+      expect(store.getCard('old-thread')).toMatchObject({ title: '既存カード', column: 'doing' });
+      expect(store.getBasePath()).toBeNull();
+      store.setBasePath('/repo/.git');
+      expect(store.getBasePath()).toBe('/repo/.git');
+      expect(store.listEvents()).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+    expect(boardColumns().filter((c) => c === 'base_path')).toHaveLength(1);
+    expect(inspect().userVersion).toBe(3);
+    expect(SCHEMA_VERSION).toBe(3);
+  });
+
+  it('移行済みの DB を開き直しても列は 1 つだけで、base_path は残る', () => {
+    const raw = new DatabaseSync(path);
+    raw.exec(V2_SQL);
+    raw.close();
+    const first = open();
+    first.setBasePath('/repo');
+    first.close();
+    const store = open();
+    expect(store.getBasePath()).toBe('/repo');
+    store.close();
+    expect(boardColumns().filter((c) => c === 'base_path')).toHaveLength(1);
+  });
+
+  it('v1 の DB も 1 回で v3 になる（t3 と base_path の両方）', () => {
+    const raw = new DatabaseSync(path);
+    raw.exec(V1_SQL);
+    raw.close();
+    open().close();
+    expect(inspect()).toEqual({ columns: expect.arrayContaining(['t3']), userVersion: 3 });
+    expect(boardColumns()).toContain('base_path');
+  });
+
+  it('新規 DB は CREATE TABLE の時点で base_path 列を持つ', () => {
+    open().close();
+    expect(boardColumns()).toContain('base_path');
+  });
+});

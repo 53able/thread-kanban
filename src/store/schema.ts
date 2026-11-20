@@ -1,11 +1,15 @@
-/** 2: cards.t3（T3 スレッドの追跡参照、JSON）を追加 */
-export const SCHEMA_VERSION = 2;
+/**
+ * 2: cards.t3（T3 スレッドの追跡参照、JSON）を追加
+ * 3: boards.base_path（boardId の元になったパス。UI の表示名に使う）を追加
+ */
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS boards (
   id TEXT PRIMARY KEY,
   stale_days INTEGER NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  base_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS columns (
