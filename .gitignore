@@ -1,0 +1,18 @@
+# 依存とビルド成果物
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+
+# デモ動画の出力（数十〜100MB）と録画の台本（録画ページがリポジトリ外にあり単体では再現できない）
+out/
+scenarios/
+
+# oh-my-claudecode の作業状態（.omc/skills/ だけは残す）
+.omc/*
+!.omc/skills/
+
+# ログと OS のファイル
+*.log
+npm-debug.log*
+.DS_Store
